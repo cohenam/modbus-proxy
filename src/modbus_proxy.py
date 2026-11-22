@@ -82,13 +82,15 @@ class Connection:
             try:
                 done, _ = await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
             except asyncio.CancelledError:
-                writer.transport.abort()
+                self._abort(writer)
                 raise
             if not done:
                 self.log.info("close timed out, aborting connection")
-                writer.transport.abort()
-            elif closed.cancelled() or closed.exception() is not None:
-                self.log.info("failed to close: %r", closed)
+                self._abort(writer)
+            elif closed.cancelled():
+                self.log.info("failed to close: cancelled")
+            elif closed.exception() is not None:
+                self.log.info("failed to close: %r", closed.exception())
             else:
                 self.log.info("connection closed")
         except Exception as error:
@@ -97,6 +99,14 @@ class Connection:
             if self.writer is writer:
                 self.reader = None
                 self.writer = None
+
+    def _abort(self, writer):
+        # Must not raise: in the cancellation path an error here would replace the
+        # CancelledError and let the cancelled caller carry on.
+        try:
+            writer.transport.abort()
+        except Exception as error:
+            self.log.info("failed to abort: %r", error)
 
     async def _write(self, data):
         self.log.debug("sending %r", data)
