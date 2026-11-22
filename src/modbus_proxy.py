@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 __version__ = "0.8.0"
 
+CLOSE_TIMEOUT = 2.0
+
 
 DEFAULT_LOG_CONFIG = {
     "version": 1,
@@ -63,18 +65,48 @@ class Connection:
         )
 
     async def close(self):
-        if self.writer is not None:
-            self.log.info("closing connection...")
+        # Work on the writer captured here: close() also runs from shutdown without the
+        # lock, and a retry may have replaced self.writer by the time the wait returns.
+        writer = self.writer
+        if writer is None:
+            return
+        self.log.info("closing connection...")
+        try:
+            writer.close()
+            # Unsent data to a peer that stopped reading keeps wait_closed() pending, and
+            # with it the caller and the lock it holds. Every wait_closed() on a writer
+            # awaits one shared future, so the deadline must not cancel the waiter
+            # (asyncio.wait_for would): that would cancel an overlapping close() too.
+            closed = asyncio.ensure_future(writer.wait_closed())
+            closed.add_done_callback(lambda fut: fut.cancelled() or fut.exception())
             try:
-                self.writer.close()
-                await self.writer.wait_closed()
-            except Exception as error:
-                self.log.info("failed to close: %r", error)
+                done, _ = await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
+            except asyncio.CancelledError:
+                self._abort(writer)
+                raise
+            if not done:
+                self.log.info("close timed out, aborting connection")
+                self._abort(writer)
+            elif closed.cancelled():
+                self.log.info("failed to close: cancelled")
+            elif closed.exception() is not None:
+                self.log.info("failed to close: %r", closed.exception())
             else:
                 self.log.info("connection closed")
-            finally:
+        except Exception as error:
+            self.log.info("failed to close: %r", error)
+        finally:
+            if self.writer is writer:
                 self.reader = None
                 self.writer = None
+
+    def _abort(self, writer):
+        # Must not raise: in the cancellation path an error here would replace the
+        # CancelledError and let the cancelled caller carry on.
+        try:
+            writer.transport.abort()
+        except Exception as error:
+            self.log.info("failed to abort: %r", error)
 
     async def _write(self, data):
         self.log.debug("sending %r", data)
@@ -232,7 +264,7 @@ def load_config(file_name):
         import yaml
 
         def load(fobj):
-            return yaml.load(fobj, Loader=yaml.Loader)
+            return yaml.safe_load(fobj)
 
     elif ext.endswith("json"):
         from json import load
