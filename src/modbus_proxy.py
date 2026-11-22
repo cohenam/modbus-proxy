@@ -68,27 +68,35 @@ class Connection:
         # Work on the writer captured here: close() also runs from shutdown without the
         # lock, and a retry may have replaced self.writer by the time the wait returns.
         writer = self.writer
-        if writer is not None:
-            self.log.info("closing connection...")
+        if writer is None:
+            return
+        self.log.info("closing connection...")
+        try:
+            writer.close()
+            # Unsent data to a peer that stopped reading keeps wait_closed() pending, and
+            # with it the caller and the lock it holds. Every wait_closed() on a writer
+            # awaits one shared future, so the deadline must not cancel the waiter
+            # (asyncio.wait_for would): that would cancel an overlapping close() too.
+            closed = asyncio.ensure_future(writer.wait_closed())
+            closed.add_done_callback(lambda fut: fut.cancelled() or fut.exception())
             try:
-                writer.close()
-                # Unsent data to a peer that stopped reading keeps wait_closed() pending,
-                # and with it the caller and the lock it holds.
-                await asyncio.wait_for(writer.wait_closed(), CLOSE_TIMEOUT)
-            except asyncio.TimeoutError:
-                self.log.info("close timed out, aborting connection")
-                writer.transport.abort()
+                done, _ = await asyncio.wait({closed}, timeout=CLOSE_TIMEOUT)
             except asyncio.CancelledError:
                 writer.transport.abort()
                 raise
-            except Exception as error:
-                self.log.info("failed to close: %r", error)
+            if not done:
+                self.log.info("close timed out, aborting connection")
+                writer.transport.abort()
+            elif closed.cancelled() or closed.exception() is not None:
+                self.log.info("failed to close: %r", closed)
             else:
                 self.log.info("connection closed")
-            finally:
-                if self.writer is writer:
-                    self.reader = None
-                    self.writer = None
+        except Exception as error:
+            self.log.info("failed to close: %r", error)
+        finally:
+            if self.writer is writer:
+                self.reader = None
+                self.writer = None
 
     async def _write(self, data):
         self.log.debug("sending %r", data)
