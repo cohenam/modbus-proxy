@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 __version__ = "0.8.0"
 
+CLOSE_TIMEOUT = 2.0
+
 
 DEFAULT_LOG_CONFIG = {
     "version": 1,
@@ -67,7 +69,12 @@ class Connection:
             self.log.info("closing connection...")
             try:
                 self.writer.close()
-                await self.writer.wait_closed()
+                # A peer that never answers the FIN (dead gateway) would keep the caller,
+                # and the lock it holds, waiting here forever.
+                await asyncio.wait_for(self.writer.wait_closed(), CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                self.log.info("close timed out, aborting connection")
+                self.writer.transport.abort()
             except Exception as error:
                 self.log.info("failed to close: %r", error)
             else:
@@ -232,7 +239,7 @@ def load_config(file_name):
         import yaml
 
         def load(fobj):
-            return yaml.load(fobj, Loader=yaml.Loader)
+            return yaml.safe_load(fobj)
 
     elif ext.endswith("json"):
         from json import load
